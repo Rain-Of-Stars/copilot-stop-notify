@@ -1,0 +1,179 @@
+name: release-package
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: 打包前执行 cargo test
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Restore Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~\.cargo\registry\cache
+            ~\.cargo\registry\index
+            ~\.cargo\git\db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        if: github.event_name == 'push' || inputs.run_tests
+        shell: pwsh
+        run: cargo test --locked
+
+      - name: Package release bundle
+        id: package
+        shell: pwsh
+        run: |
+          $result = ./package_release.ps1 -SkipTests
+          $parsed = $result | ConvertFrom-Json
+
+          if (-not $parsed.ok) {
+            throw "打包脚本未返回成功状态"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($parsed.zipPath)) {
+            throw "打包脚本没有生成 zip 文件"
+          }
+
+          $artifactName = "copilot-stop-notif-$($parsed.version)-windows-x64"
+
+          "version=$($parsed.version)" >> $env:GITHUB_OUTPUT
+          "zip_path=$($parsed.zipPath)" >> $env:GITHUB_OUTPUT
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+      - name: Validate bundle contents
+        shell: pwsh
+        run: |
+          $extractRoot = Join-Path $env:RUNNER_TEMP "copilot-stop-notif-package"
+          if (Test-Path $extractRoot) {
+            Remove-Item -Recurse -Force $extractRoot
+          }
+
+          Expand-Archive -LiteralPath "${{ steps.package.outputs.zip_path }}" -DestinationPath $extractRoot -Force
+          $bundleRoot = Get-ChildItem -Path $extractRoot | Where-Object { $_.PSIsContainer } | Select-Object -First 1
+
+          if ($null -eq $bundleRoot) {
+            throw "zip 文件中未找到发布目录"
+          }
+
+          $requiredPaths = @(
+            "README.md",
+            ".github/hooks/copilot-stop-notif.json",
+            ".github/hooks/copilot-stop-notif/copilot-stop-notif.env.example",
+            ".github/hooks/copilot-stop-notif/copilot-stop-notif.exe"
+          )
+
+          foreach ($relativePath in $requiredPaths) {
+            $fullPath = Join-Path $bundleRoot.FullName $relativePath
+            if (-not (Test-Path $fullPath)) {
+              throw "发布包缺少必需文件: $relativePath"
+            }
+          }
+
+          $forbiddenPaths = @(
+            ".git",
+            "src",
+            "tests",
+            "target",
+            "dist",
+            ".github/hooks/copilot-stop-notif.env",
+            ".github/hooks/copilot-stop-notif.exe",
+            ".github/hooks/copilot-stop-notif.env.example"
+          )
+
+          foreach ($relativePath in $forbiddenPaths) {
+            $fullPath = Join-Path $bundleRoot.FullName $relativePath
+            if (Test-Path $fullPath) {
+              throw "发布包包含禁止文件或目录: $relativePath"
+            }
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.zip_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release-artifact
+
+      - name: Verify tag version
+        shell: pwsh
+        run: |
+          $expectedTag = "v${{ needs.build.outputs.version }}"
+          if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+            throw "Git tag 与 Cargo.toml 版本不一致，应为 $expectedTag，实际为 $env:GITHUB_REF_NAME"
+          }
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $tagName = $env:GITHUB_REF_NAME
+          $zipFile = Get-ChildItem -Path release-artifact -File | Select-Object -First 1
+          if ($null -eq $zipFile) {
+            throw "未找到待上传的发布包"
+          }
+
+          $zipPath = $zipFile.FullName
+          $releaseTitle = "copilot-stop-notify $tagName"
+
+          gh release view $tagName --repo $env:GH_REPO *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tagName $zipPath --repo $env:GH_REPO --clobber
+          }
+          else {
+            gh release create $tagName $zipPath --repo $env:GH_REPO --title $releaseTitle --generate-notes
+          }

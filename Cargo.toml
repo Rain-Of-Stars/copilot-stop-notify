@@ -1,0 +1,27 @@
+[package]
+name = "copilot-stop-notif"
+version = "1.1.0"
+edition = "2024"
+description = "Email-only Stop hook notifier for VS Code Copilot"
+readme = "README.md"
+
+[lib]
+name = "copilot_stop_notif"
+path = "src/lib.rs"
+
+[[bin]]
+name = "copilot-stop-notif"
+path = "src/main_copilot_stop_notif.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["clock"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "hostname", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.13"
