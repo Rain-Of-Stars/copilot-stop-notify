@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "copilot-stop-notif"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "chrono",

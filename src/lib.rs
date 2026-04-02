@@ -7,15 +7,19 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
 
 pub const DEFAULT_ENV_FILE: &str = ".github/hooks/copilot-stop-notif.env";
 
@@ -27,6 +31,8 @@ const MAX_TRANSCRIPT_MESSAGES: usize = 24;
 const MAX_MESSAGE_CHARS: usize = 4000;
 const MAX_FALLBACK_CHARS: usize = 8000;
 const EMAIL_FOOTER_BRAND: &str = "copilot-stop-notify";
+const DELIVERY_DEDUP_WINDOW: Duration = Duration::from_secs(120);
+const DELIVERY_LOCK_STALE_WINDOW: Duration = Duration::from_secs(300);
 
 const CONTAINER_KEYS: [&str; 10] = [
     "messages",
@@ -261,11 +267,13 @@ fn validate_legacy_channels(env_map: &HashMap<String, String>) -> Result<()> {
         return Ok(());
     };
 
-    for channel in channels.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for channel in channels
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         if !channel.eq_ignore_ascii_case(EMAIL_CHANNEL_NAME) {
-            bail!(
-                "当前版本仅支持 email 通知渠道，请移除不支持的配置项: {channel}"
-            );
+            bail!("当前版本仅支持 email 通知渠道，请移除不支持的配置项: {channel}");
         }
     }
 
@@ -384,16 +392,11 @@ pub fn send_email(
     text_body: &str,
     html_body: &str,
 ) -> Result<()> {
-    let from: Mailbox = config
-        .email_from
-        .parse()
-        .context("发件人地址格式不正确")?;
+    let from: Mailbox = config.email_from.parse().context("发件人地址格式不正确")?;
 
     let mut builder = Message::builder().from(from).subject(title);
     for recipient in &config.recipients {
-        let mailbox: Mailbox = recipient
-            .parse()
-            .context("收件人地址格式不正确")?;
+        let mailbox: Mailbox = recipient.parse().context("收件人地址格式不正确")?;
         builder = builder.to(mailbox);
     }
 
@@ -444,6 +447,25 @@ enum ParsedNotifyInput {
     Ignored { source: String, event_type: String },
 }
 
+struct DeliveryLock {
+    lock_path: PathBuf,
+    sent_path: PathBuf,
+}
+
+impl DeliveryLock {
+    fn mark_sent(&self) -> Result<()> {
+        fs::write(&self.sent_path, now_text()).context("写入通知去重标记失败")?;
+        let _ = fs::remove_file(&self.lock_path);
+        Ok(())
+    }
+}
+
+impl Drop for DeliveryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
 pub fn build_vscode_notify_payload(
     hook_input: &Value,
     transcript_data: Option<&TranscriptData>,
@@ -481,7 +503,10 @@ fn parse_notify_request<R: Read>(
     payload_json: Option<&str>,
     env_map: &HashMap<String, String>,
 ) -> Result<ParsedNotifyInput> {
-    if let Some(raw_payload) = payload_json.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(raw_payload) = payload_json
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let payload =
             serde_json::from_str::<Value>(raw_payload).context("命令行 JSON 不是合法 JSON")?;
         if !payload.is_object() {
@@ -508,9 +533,17 @@ fn parse_notify_request<R: Read>(
     let is_vscode_hook = hook_input.get("hookEventName").is_some() || !transcript_path.is_empty();
 
     if is_vscode_hook {
+        let event_type = extract_string_field(&hook_input, &["hookEventName"]).to_ascii_lowercase();
+        if should_ignore_vscode_hook(&hook_input, &event_type) {
+            return Ok(ParsedNotifyInput::Ignored {
+                source: "vscode-copilot".to_string(),
+                event_type,
+            });
+        }
+
         let transcript_data = load_vscode_transcript(&hook_input, &transcript_path, env_map);
         let data = build_vscode_notify_payload(&hook_input, transcript_data.as_ref());
-        let event_type = extract_string_field(&data, &["notify_event_type"]);
+        let event_type = extract_string_field(&data, &["notify_event_type"]).to_ascii_lowercase();
 
         return Ok(ParsedNotifyInput::Request(NotificationRequest {
             source: "vscode-copilot".to_string(),
@@ -535,6 +568,99 @@ fn parse_notify_request<R: Read>(
         },
         data: hook_input,
     }))
+}
+
+fn should_ignore_vscode_hook(hook_input: &Value, event_type: &str) -> bool {
+    if event_type != "stop" {
+        return true;
+    }
+
+    if extract_bool_field(hook_input, &["stop_hook_active"]).unwrap_or(false) {
+        return true;
+    }
+
+    has_subagent_context(hook_input)
+}
+
+fn has_subagent_context(hook_input: &Value) -> bool {
+    !extract_string_field(hook_input, &["agent_id", "agentId"]).is_empty()
+        || !extract_string_field(hook_input, &["agent_type", "agentType"]).is_empty()
+}
+
+fn reserve_vscode_stop_delivery(data: &Value) -> Result<Option<DeliveryLock>> {
+    let state_dir = env::temp_dir()
+        .join("copilot-stop-notify")
+        .join("delivery-state");
+    fs::create_dir_all(&state_dir).context("创建通知去重目录失败")?;
+
+    let key = build_delivery_key("vscode-copilot", "stop", data);
+    let marker_name = format!("{:016x}", hash_text(&key));
+    let sent_path = state_dir.join(format!("{marker_name}.sent"));
+    if file_is_fresh(&sent_path, DELIVERY_DEDUP_WINDOW) {
+        return Ok(None);
+    }
+    if sent_path.exists() {
+        let _ = fs::remove_file(&sent_path);
+    }
+
+    let lock_path = state_dir.join(format!("{marker_name}.lock"));
+    if !acquire_delivery_lock(&lock_path)? {
+        return Ok(None);
+    }
+
+    Ok(Some(DeliveryLock {
+        lock_path,
+        sent_path,
+    }))
+}
+
+fn acquire_delivery_lock(lock_path: &Path) -> Result<bool> {
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(now_text().as_bytes())
+                    .context("写入通知锁文件失败")?;
+                return Ok(true);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if file_is_fresh(lock_path, DELIVERY_LOCK_STALE_WINDOW) {
+                    return Ok(false);
+                }
+                let _ = fs::remove_file(lock_path);
+            }
+            Err(error) => return Err(error).context("创建通知锁文件失败"),
+        }
+    }
+
+    Ok(false)
+}
+
+fn file_is_fresh(path: &Path, window: Duration) -> bool {
+    path.metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed <= window)
+        .unwrap_or(false)
+}
+
+fn build_delivery_key(source: &str, event_type: &str, data: &Value) -> String {
+    format!(
+        "{source}|{event_type}|{}|{}|{}",
+        extract_string_field(data, &["session_id", "sessionId"]),
+        extract_string_field(data, &["cwd"]),
+        serde_json::to_string(data).unwrap_or_default()
+    )
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn load_vscode_transcript(
@@ -593,7 +719,11 @@ fn collect_allowed_transcript_roots(
     let mut roots = default_transcript_roots();
 
     if let Some(configured) = config_value(env_map, "TRANSCRIPT_ALLOWED_ROOTS") {
-        for item in configured.split(';').map(str::trim).filter(|item| !item.is_empty()) {
+        for item in configured
+            .split(';')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
             let expanded = expand_env_placeholders(item);
             if let Some(path) = canonicalize_existing_dir(PathBuf::from(expanded)) {
                 push_unique_root(&mut roots, path);
@@ -636,7 +766,9 @@ fn expand_env_placeholders(input: &str) -> String {
                 let end = start + offset;
                 let key = chars[start..end].iter().collect::<String>();
 
-                if !key.is_empty() && let Some(value) = env::var_os(&key) {
+                if !key.is_empty()
+                    && let Some(value) = env::var_os(&key)
+                {
                     output.push_str(&value.to_string_lossy());
                     index = end + 1;
                     continue;
@@ -1064,6 +1196,15 @@ pub fn run_notify<R: Read>(
     };
     let recipient_count = config.recipients.len();
 
+    let delivery_lock = if !dry_run && source == "vscode-copilot" && event_type == "stop" {
+        match reserve_vscode_stop_delivery(&data)? {
+            Some(lock) => Some(lock),
+            None => return Ok(HookRunSummary::ignored(source, event_type)),
+        }
+    } else {
+        None
+    };
+
     if dry_run {
         return Ok(HookRunSummary::success(
             source,
@@ -1081,22 +1222,26 @@ pub fn run_notify<R: Read>(
         &data,
         config.email_include_context,
     );
-    let html_body = build_email_html_with_options(
-        &title,
-        &source,
-        &data,
-        config.email_include_context,
-    );
+    let html_body =
+        build_email_html_with_options(&title, &source, &data, config.email_include_context);
 
     match send_email(&config, &title, &text_body, &html_body) {
-        Ok(()) => Ok(HookRunSummary::success(
-            source,
-            event_type,
-            title,
-            recipient_count,
-            true,
-            false,
-        )),
+        Ok(()) => {
+            if let Some(lock) = delivery_lock.as_ref()
+                && let Err(error) = lock.mark_sent()
+            {
+                eprintln!("{error}");
+            }
+
+            Ok(HookRunSummary::success(
+                source,
+                event_type,
+                title,
+                recipient_count,
+                true,
+                false,
+            ))
+        }
         Err(error) => {
             eprintln!("{error}");
             Ok(HookRunSummary::failure(
@@ -1233,7 +1378,9 @@ fn extract_vscode_event_message(node: &Map<String, Value>) -> Option<Conversatio
     let role = normalized_role(event_type.split('.').next()?)?;
     let data = node.get("data")?.as_object()?;
     let mut text = data.get("content").map(text_from_value).unwrap_or_default();
-    if text.is_empty() && let Some(message) = data.get("message") {
+    if text.is_empty()
+        && let Some(message) = data.get("message")
+    {
         text = text_from_value(message);
     }
 
@@ -1306,6 +1453,16 @@ fn extract_string_field(value: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
+fn extract_bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(flag) = value.get(*key).and_then(Value::as_bool) {
+            return Some(flag);
+        }
+    }
+
+    None
+}
+
 fn fallback_text(hook_input: &Value, transcript_data: Option<&TranscriptData>) -> String {
     let message = match transcript_data {
         Some(TranscriptData::RawText(_)) => {
@@ -1313,7 +1470,8 @@ fn fallback_text(hook_input: &Value, transcript_data: Option<&TranscriptData>) -
         }
         Some(TranscriptData::Json(_)) => "已读取 transcript，但未提取到可显示的对话内容。",
         None => {
-            let event_type = extract_string_field(hook_input, &["hookEventName", "notify_event_type"]);
+            let event_type =
+                extract_string_field(hook_input, &["hookEventName", "notify_event_type"]);
             if event_type.is_empty() {
                 "未读取到可用 transcript，已省略原始 Hook 输入。"
             } else {
@@ -1453,8 +1611,8 @@ fn collect_email_context_fields(data: &Value) -> Vec<(String, String)> {
 }
 
 fn read_text_file_limited(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("读取 {label} 元数据失败"))?;
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("读取 {label} 元数据失败"))?;
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
