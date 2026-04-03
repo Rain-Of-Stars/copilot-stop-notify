@@ -1,0 +1,9 @@
+/target
+/dist
+*.pdb
+*.d
+
+# 含真实 SMTP 密码的配置文件
+copilot-stop-notif.env
+*.env
+!*.env.example

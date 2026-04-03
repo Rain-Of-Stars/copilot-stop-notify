@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "type": "command",
+        "windows": "& \"$env:USERPROFILE\\.copilot\\hooks\\copilot-stop-notif\\copilot-stop-notify.exe\" --env-file \"$env:USERPROFILE\\.copilot\\hooks\\copilot-stop-notif\\copilot-stop-notif.env\"",
+        "linux": "\"$HOME/.copilot/hooks/copilot-stop-notif/copilot-stop-notify\" --env-file \"$HOME/.copilot/hooks/copilot-stop-notif/copilot-stop-notif.env\"",
+        "timeout": 45
+      }
+    ]
+  }
+}

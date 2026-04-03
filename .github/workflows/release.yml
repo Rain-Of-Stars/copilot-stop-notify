@@ -1,0 +1,132 @@
+# 发布工作流：当推送 v* 标签时自动构建多平台 ZIP 并创建 GitHub Release
+# ZIP 内部结构为 hooks/ 树，用户解压到 ~/.copilot/ 即可直接使用
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.zip_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            zip_name: copilot-stop-notify-windows-x86_64.zip
+            bin_ext: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zip_name: copilot-stop-notify-linux-x86_64.zip
+            bin_ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            zip_name: copilot-stop-notify-macos-x86_64.zip
+            bin_ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            zip_name: copilot-stop-notify-macos-arm64.zip
+            bin_ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: 运行测试
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: cargo test --locked --verbose
+
+      - name: 构建 Release 二进制
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # ZIP 内部目录结构（解压到 ~/.copilot/ 直接可用）:
+      #   hooks/
+      #   ├── copilot-stop-notify.json          ← Claude Code CLI Hook 配置（可选）
+      #   └── copilot-stop-notif/
+      #       ├── copilot-stop-notify[.exe]      ← 可执行文件
+      #       └── copilot-stop-notif.env.example ← 配置文件模板
+
+      - name: 打包 ZIP（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dest = "dist\hooks\copilot-stop-notif"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\copilot-stop-notify.exe" $dest
+          Copy-Item "hooks\copilot-stop-notif\copilot-stop-notif.env.example"     $dest
+          Copy-Item "hooks\copilot-stop-notify.json"                              "dist\hooks\"
+          Compress-Archive -Path "dist\hooks" -DestinationPath "${{ matrix.zip_name }}"
+          $hash = (Get-FileHash "${{ matrix.zip_name }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.zip_name }}" | Out-File -Encoding ascii "${{ matrix.zip_name }}.sha256"
+
+      - name: 打包 ZIP（Unix）
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/hooks/copilot-stop-notif
+          cp "target/${{ matrix.target }}/release/copilot-stop-notify" \
+             dist/hooks/copilot-stop-notif/
+          chmod 755 dist/hooks/copilot-stop-notif/copilot-stop-notify
+          cp hooks/copilot-stop-notif/copilot-stop-notif.env.example \
+             dist/hooks/copilot-stop-notif/
+          cp hooks/copilot-stop-notify.json dist/hooks/
+          cd dist && zip -r ../${{ matrix.zip_name }} hooks/
+          cd ..
+          sha256sum "${{ matrix.zip_name }}" > "${{ matrix.zip_name }}.sha256"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip_name }}
+          path: |
+            ${{ matrix.zip_name }}
+            ${{ matrix.zip_name }}.sha256
+
+  release:
+    name: 创建 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: 汇总 SHA256 校验文件
+        run: |
+          cat *.sha256 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.zip
+            *.sha256
+            SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
