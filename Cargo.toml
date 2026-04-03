@@ -1,6 +1,6 @@
 [package]
 name = "copilot-stop-notify"
-version = "0.1.3"
+version = "2.0.0"
 edition = "2021"
 description = "VS Code Copilot 会话结束后自动发送邮件通知"
 
