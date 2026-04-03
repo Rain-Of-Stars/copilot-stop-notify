@@ -92,7 +92,12 @@ jobs:
           cp hooks/copilot-stop-notify.json dist/hooks/
           cd dist && zip -r ../${{ matrix.zip_name }} hooks/
           cd ..
-          sha256sum "${{ matrix.zip_name }}" > "${{ matrix.zip_name }}.sha256"
+          # macOS 没有 sha256sum，使用 shasum -a 256 兼容
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${{ matrix.zip_name }}" > "${{ matrix.zip_name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.zip_name }}" > "${{ matrix.zip_name }}.sha256"
+          fi
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
